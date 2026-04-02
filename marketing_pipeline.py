@@ -431,7 +431,75 @@ def build_html_report(data: dict) -> str:
 
 # ── 6. TELEGRAM SENDER ───────────────────────────────────────────────────────
 
-def send_telegram(data: dict):
+def _build_summary_chart(data: dict) -> bytes:
+    """Generate a 2-panel PNG: WoW spend bar + spend by channel."""
+    by_ch = data["by_channel_lw"].head(6)  # top 6 channels
+    wow = data["spend_wow"]
+    arrow = f"+{wow:.1f}%" if wow >= 0 else f"{wow:.1f}%"
+    wow_color = "#16A34A" if wow >= 0 else "#DC2626"
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=(
+            f"Week-over-Week Spend  ({arrow})",
+            "Spend by Channel  (last week)",
+        ),
+        horizontal_spacing=0.14,
+    )
+
+    # Left: WoW bars
+    fig.add_trace(go.Bar(
+        x=["Prev Week", "Last Week"],
+        y=[data["pw_spend"], data["lw_spend"]],
+        marker_color=["#94A3B8", wow_color],
+        text=[fmt_idr(data["pw_spend"]), fmt_idr(data["lw_spend"])],
+        textposition="outside",
+        hoverinfo="skip",
+    ), row=1, col=1)
+
+    # Right: spend by channel
+    fig.add_trace(go.Bar(
+        x=by_ch["Channel"],
+        y=by_ch["Spend"],
+        marker_color=COLORS[:len(by_ch)],
+        text=[fmt_idr(v) for v in by_ch["Spend"]],
+        textposition="outside",
+        hoverinfo="skip",
+    ), row=1, col=2)
+
+    fig.update_layout(
+        **CHART_LAYOUT,
+        height=420, width=960,
+        showlegend=False,
+        title=dict(
+            text=f"Marketing Summary  —  {data['lw_start'].strftime('%b %d')}–{data['lw_end'].strftime('%b %d, %Y')}",
+            font=dict(size=15),
+        ),
+    )
+    fig.update_yaxes(visible=False)
+    return fig.to_image(format="png", scale=2)
+
+
+def _send_multipart(url: str, fields: dict, file_field: str, filename: str,
+                    file_bytes: bytes, mime: str):
+    """POST multipart/form-data with one file field."""
+    boundary = "----TGBoundary7MA4YWxkTrZu0gW"
+    body = b""
+    for k, v in fields.items():
+        body += (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+        ).encode()
+    body += (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; "
+        f"filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n"
+    ).encode() + file_bytes + f"\r\n--{boundary}--\r\n".encode()
+    urllib.request.urlopen(urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    ))
+
+
+def send_telegram(data: dict, report_path: str):
     import urllib.parse
 
     token = os.getenv("TELEGRAM_TOKEN")
@@ -441,26 +509,49 @@ def send_telegram(data: dict):
 
     base = f"https://api.telegram.org/bot{token}"
     lw_label = f"{data['lw_start'].strftime('%b %d')}–{data['lw_end'].strftime('%b %d, %Y')}"
-
-    # Weekly spend WoW
-    arrow = "↑" if data["spend_wow"] >= 0 else "↓"
     wow_sign = "+" if data["spend_wow"] >= 0 else ""
-    weekly_block = (
-        f"📊 *WEEKLY SPEND*\n"
-        f"Last week:  {fmt_idr(data['lw_spend'])}\n"
-        f"Prev week:  {fmt_idr(data['pw_spend'])}\n"
-        f"Change:     {wow_sign}{data['spend_wow']:.1f}% {arrow}"
-    )
+    arrow = "↑" if data["spend_wow"] >= 0 else "↓"
 
-    # By Channel — last week
-    ch_lines = "\n".join(
-        f"• {row['Channel']:<14} {fmt_idr(row['Spend'])} | {row['Conversions']:,.0f} conv | CPA {fmt_idr(row['CPA']) if row['Conversions'] > 0 else 'N/A'}"
-        for _, row in data["by_channel_lw"].iterrows()
-    )
-    channel_block = f"💰 *BY CHANNEL* (last week)\n{ch_lines}"
+    # ── 1. Chart image + short caption ──────────────────────────────────────
+    print("    → Generating summary chart ...")
+    chart_png = _build_summary_chart(data)
 
-    # Vertical > Campaign > Channel — last week
+    # Top 3 channels for caption
+    top3_ch = data["by_channel_lw"].head(3)
+    top3_lines = "\n".join(
+        f"  • {row['Channel']}: {fmt_idr(row['Spend'])} | CPA {fmt_idr(row['CPA']) if row['Conversions'] > 0 else 'N/A'}"
+        for _, row in top3_ch.iterrows()
+    )
+    # Vertical totals for caption
     vcc_df = data["lw_vcc"]
+    vert_lines = []
+    for v in data["target_verticals"]:
+        v_df = vcc_df[vcc_df["Vertical"] == v]
+        if v_df.empty:
+            continue
+        vs = v_df["Spend"].sum()
+        vc = v_df["Conversions"].sum()
+        vc_cpa = vs / vc if vc > 0 else 0
+        vert_lines.append(f"  {v}: {fmt_idr(vs)} | {vc:,.0f} conv | CPA {fmt_idr(vc_cpa)}")
+
+    caption = (
+        f"📣 *Marketing Report — {lw_label}*\n\n"
+        f"📊 Spend: *{fmt_idr(data['lw_spend'])}* ({wow_sign}{data['spend_wow']:.1f}% {arrow} vs prev week)\n"
+        f"🎯 Conv: *{data['by_channel_lw']['Conversions'].sum():,.0f}*  |  "
+        f"CPA: *{fmt_idr(data['lw_spend'] / data['by_channel_lw']['Conversions'].sum())}*\n\n"
+        f"💰 *Top Channels:*\n{top3_lines}\n\n"
+        f"🎯 *By Vertical:*\n" + "\n".join(vert_lines)
+    ).replace("_", "\\_")
+
+    _send_multipart(
+        url=f"{base}/sendPhoto",
+        fields={"chat_id": chat_id, "caption": caption, "parse_mode": "Markdown"},
+        file_field="photo", filename="summary.png",
+        file_bytes=chart_png, mime="image/png",
+    )
+    print("    → Chart + caption sent")
+
+    # ── 2. Full vertical breakdown as text ──────────────────────────────────
     vertical_blocks = []
     for vertical in data["target_verticals"]:
         v_df = vcc_df[vcc_df["Vertical"] == vertical]
@@ -469,7 +560,7 @@ def send_telegram(data: dict):
         v_spend = v_df["Spend"].sum()
         v_conv = v_df["Conversions"].sum()
         v_cpa = v_spend / v_conv if v_conv > 0 else 0
-        lines = [f"🎯 *VERTICAL: {vertical}* — {fmt_idr(v_spend)} | {v_conv:,.0f} conv | CPA {fmt_idr(v_cpa)}"]
+        lines = [f"🎯 *{vertical}* — {fmt_idr(v_spend)} | {v_conv:,.0f} conv | CPA {fmt_idr(v_cpa)}"]
         for campaign in v_df["Campaign"].unique():
             c_df = v_df[v_df["Campaign"] == campaign].sort_values("Spend", ascending=False)
             c_spend = c_df["Spend"].sum()
@@ -477,48 +568,44 @@ def send_telegram(data: dict):
             lines.append(f"\n  📌 *{campaign}* — {fmt_idr(c_spend)} | {c_conv:,.0f} conv")
             for _, row in c_df.iterrows():
                 cpa_str = fmt_idr(row["CPA"]) if row["Conversions"] > 0 else "N/A"
-                lines.append(f"    · {row['Channel']:<12} {fmt_idr(row['Spend'])} | {row['Conversions']:,.0f} conv | CPA {cpa_str}")
+                lines.append(f"    · {row['Channel']}: {fmt_idr(row['Spend'])} | {row['Conversions']:,.0f} conv | CPA {cpa_str}")
         vertical_blocks.append("\n".join(lines))
 
-    divider = "\n━━━━━━━━━━━━━━━━━━━\n"
-    msg = (
-        f"📣 *Marketing Report — {lw_label}*\n\n"
-        f"{weekly_block}\n\n"
-        f"{channel_block}\n\n"
-        + divider.join(vertical_blocks)
-    )
+    breakdown_msg = (
+        f"📋 *Breakdown by Vertical — {lw_label}*\n\n"
+        + "\n\n━━━━━━━━━━━━━━━━━━━\n\n".join(vertical_blocks)
+    ).replace("_", "\\_")
 
-    print(f"  [DEBUG] Message length: {len(msg)} chars")
-
-    # Telegram Markdown v1: escape underscores in values to avoid parse errors
-    def tg_escape(text):
-        return text.replace("_", "\\_")
-
-    safe_msg = tg_escape(msg)
-
-    # Split into chunks of 4000 chars max (Telegram limit is 4096)
-    chunks = [safe_msg[i:i+4000] for i in range(0, len(safe_msg), 4000)]
+    # Send in chunks if needed
+    chunks = [breakdown_msg[i:i+4000] for i in range(0, len(breakdown_msg), 4000)]
     for chunk in chunks:
         params = urllib.parse.urlencode({
-            "chat_id": chat_id,
-            "text": chunk,
-            "parse_mode": "Markdown",
+            "chat_id": chat_id, "text": chunk, "parse_mode": "Markdown",
         }).encode()
         try:
-            urllib.request.urlopen(
-                urllib.request.Request(f"{base}/sendMessage", data=params)
-            )
+            urllib.request.urlopen(urllib.request.Request(f"{base}/sendMessage", data=params))
         except Exception as e:
-            # Fallback: send without Markdown if parse fails
-            print(f"  ⚠️  Markdown failed ({e}), retrying as plain text...")
+            print(f"    ⚠️  Markdown failed ({e}), retrying plain text...")
             params = urllib.parse.urlencode({
                 "chat_id": chat_id,
-                "text": chunk.replace("*", "").replace("_", ""),
+                "text": chunk.replace("*", "").replace("_", "").replace("\\", ""),
             }).encode()
-            urllib.request.urlopen(
-                urllib.request.Request(f"{base}/sendMessage", data=params)
-            )
-    print(f"  ✅ Message sent to Telegram chat {chat_id}")
+            urllib.request.urlopen(urllib.request.Request(f"{base}/sendMessage", data=params))
+    print("    → Breakdown text sent")
+
+    # ── 3. HTML report as file attachment ───────────────────────────────────
+    with open(report_path, "rb") as f:
+        html_bytes = f.read()
+    report_filename = f"marketing_report_{date.today().isoformat()}.html"
+    _send_multipart(
+        url=f"{base}/sendDocument",
+        fields={"chat_id": chat_id, "caption": f"📎 Full report — {lw_label}"},
+        file_field="document", filename=report_filename,
+        file_bytes=html_bytes, mime="text/html",
+    )
+    print("    → HTML report file sent")
+
+    print(f"  ✅ All messages sent to Telegram chat {chat_id}")
 
 # ── 7. MAIN ──────────────────────────────────────────────────────────────────
 
@@ -552,7 +639,7 @@ def main():
     if has_telegram and not args.no_telegram:
         print("\n📨 Sending to Telegram ...")
         try:
-            send_telegram(data)
+            send_telegram(data, report_path)
         except Exception as e:
             print(f"  ❌ Telegram failed: {e}")
 
