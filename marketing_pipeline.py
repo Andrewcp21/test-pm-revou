@@ -152,10 +152,44 @@ def analyze(df: pd.DataFrame) -> dict:
     spend_l3d = latest["Spend L3D"].sum()
     spend_l14d_avg = latest["Spend L14D"].sum() / 14 * 3 if latest["Spend L14D"].sum() > 0 else 0
 
+    # ── Last week vs previous week ──────────────────────────────────────────
+    import numpy as np
+    lw_end = latest_date
+    lw_start = lw_end - pd.Timedelta(days=6)
+    pw_end = lw_start - pd.Timedelta(days=1)
+    pw_start = pw_end - pd.Timedelta(days=6)
+
+    lw_df = df[(df["date"] >= lw_start) & (df["date"] <= lw_end)]
+    pw_df = df[(df["date"] >= pw_start) & (df["date"] <= pw_end)]
+
+    lw_spend = lw_df["Spend"].sum()
+    pw_spend = pw_df["Spend"].sum()
+    spend_wow = ((lw_spend - pw_spend) / pw_spend * 100) if pw_spend > 0 else 0
+
+    # By Channel — last week
+    by_channel_lw = lw_df.groupby("Channel").agg(
+        Spend=("Spend", "sum"),
+        Conversions=("Conversion", "sum"),
+    ).reset_index()
+    by_channel_lw["CPA"] = by_channel_lw["Spend"] / by_channel_lw["Conversions"].replace(0, np.nan)
+    by_channel_lw = by_channel_lw.sort_values("Spend", ascending=False)
+
+    # Vertical > Campaign > Channel — last week (only DM, DA, SWE)
+    target_verticals = ["DM", "DA", "SWE"]
+    lw_vcc = lw_df[lw_df["Vertical"].isin(target_verticals)].groupby(
+        ["Vertical", "Campaign", "Channel"]
+    ).agg(
+        Spend=("Spend", "sum"),
+        Conversions=("Conversion", "sum"),
+    ).reset_index()
+    lw_vcc["CPA"] = lw_vcc["Spend"] / lw_vcc["Conversions"].replace(0, np.nan)
+
     return {
         "df": df,
         "latest_date": latest_date,
         "earliest_date": earliest_date,
+        "lw_start": lw_start,
+        "lw_end": lw_end,
         "total_spend": total_spend,
         "total_impressions": total_impressions,
         "total_clicks": total_clicks,
@@ -171,6 +205,12 @@ def analyze(df: pd.DataFrame) -> dict:
         "pivot_spend": pivot_spend,
         "spend_l3d": spend_l3d,
         "spend_l14d_avg": spend_l14d_avg,
+        "lw_spend": lw_spend,
+        "pw_spend": pw_spend,
+        "spend_wow": spend_wow,
+        "by_channel_lw": by_channel_lw,
+        "lw_vcc": lw_vcc,
+        "target_verticals": target_verticals,
     }
 
 # ── 3. CHART BUILDERS ────────────────────────────────────────────────────────
@@ -400,32 +440,84 @@ def send_telegram(data: dict):
         raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set in .env")
 
     base = f"https://api.telegram.org/bot{token}"
+    lw_label = f"{data['lw_start'].strftime('%b %d')}–{data['lw_end'].strftime('%b %d, %Y')}"
 
-    top_channel = data["by_channel"].iloc[0]
-    channel_lines = "\n".join(
-        f"  • {row['Channel']}: {fmt_idr(row['Spend'])} | {row['Conversions']:,.0f} conv | CPA {fmt_idr(row['CPA'])}"
-        for _, row in data["by_channel"].iterrows()
+    # Weekly spend WoW
+    arrow = "↑" if data["spend_wow"] >= 0 else "↓"
+    wow_sign = "+" if data["spend_wow"] >= 0 else ""
+    weekly_block = (
+        f"📊 *WEEKLY SPEND*\n"
+        f"Last week:  {fmt_idr(data['lw_spend'])}\n"
+        f"Prev week:  {fmt_idr(data['pw_spend'])}\n"
+        f"Change:     {wow_sign}{data['spend_wow']:.1f}% {arrow}"
     )
 
+    # By Channel — last week
+    ch_lines = "\n".join(
+        f"• {row['Channel']:<14} {fmt_idr(row['Spend'])} | {row['Conversions']:,.0f} conv | CPA {fmt_idr(row['CPA']) if row['Conversions'] > 0 else 'N/A'}"
+        for _, row in data["by_channel_lw"].iterrows()
+    )
+    channel_block = f"💰 *BY CHANNEL* (last week)\n{ch_lines}"
+
+    # Vertical > Campaign > Channel — last week
+    vcc_df = data["lw_vcc"]
+    vertical_blocks = []
+    for vertical in data["target_verticals"]:
+        v_df = vcc_df[vcc_df["Vertical"] == vertical]
+        if v_df.empty:
+            continue
+        v_spend = v_df["Spend"].sum()
+        v_conv = v_df["Conversions"].sum()
+        v_cpa = v_spend / v_conv if v_conv > 0 else 0
+        lines = [f"🎯 *VERTICAL: {vertical}* — {fmt_idr(v_spend)} | {v_conv:,.0f} conv | CPA {fmt_idr(v_cpa)}"]
+        for campaign in v_df["Campaign"].unique():
+            c_df = v_df[v_df["Campaign"] == campaign].sort_values("Spend", ascending=False)
+            c_spend = c_df["Spend"].sum()
+            c_conv = c_df["Conversions"].sum()
+            lines.append(f"\n  📌 *{campaign}* — {fmt_idr(c_spend)} | {c_conv:,.0f} conv")
+            for _, row in c_df.iterrows():
+                cpa_str = fmt_idr(row["CPA"]) if row["Conversions"] > 0 else "N/A"
+                lines.append(f"    · {row['Channel']:<12} {fmt_idr(row['Spend'])} | {row['Conversions']:,.0f} conv | CPA {cpa_str}")
+        vertical_blocks.append("\n".join(lines))
+
+    divider = "\n━━━━━━━━━━━━━━━━━━━\n"
     msg = (
-        f"📣 *Marketing Report — {data['latest_date'].strftime('%B %d, %Y')}*\n\n"
-        f"*Period:* {data['earliest_date'].strftime('%b %d')} – {data['latest_date'].strftime('%b %d, %Y')}\n\n"
-        f"*Total Spend:* {fmt_idr(data['total_spend'])}\n"
-        f"*Impressions:* {fmt_num(data['total_impressions'])}\n"
-        f"*Clicks:* {fmt_num(data['total_clicks'])} (CTR: {fmt_pct(data['overall_ctr'])})\n"
-        f"*Conversions:* {fmt_num(data['total_conversions'])} (CR: {fmt_pct(data['overall_cr'])})\n"
-        f"*Overall CPA:* {fmt_idr(data['overall_cpa'])}\n\n"
-        f"*By Channel:*\n{channel_lines}"
+        f"📣 *Marketing Report — {lw_label}*\n\n"
+        f"{weekly_block}\n\n"
+        f"{channel_block}\n\n"
+        + divider.join(vertical_blocks)
     )
 
-    params = urllib.parse.urlencode({
-        "chat_id": chat_id,
-        "text": msg,
-        "parse_mode": "Markdown",
-    }).encode()
-    urllib.request.urlopen(
-        urllib.request.Request(f"{base}/sendMessage", data=params)
-    )
+    print(f"  [DEBUG] Message length: {len(msg)} chars")
+
+    # Telegram Markdown v1: escape underscores in values to avoid parse errors
+    def tg_escape(text):
+        return text.replace("_", "\\_")
+
+    safe_msg = tg_escape(msg)
+
+    # Split into chunks of 4000 chars max (Telegram limit is 4096)
+    chunks = [safe_msg[i:i+4000] for i in range(0, len(safe_msg), 4000)]
+    for chunk in chunks:
+        params = urllib.parse.urlencode({
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": "Markdown",
+        }).encode()
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(f"{base}/sendMessage", data=params)
+            )
+        except Exception as e:
+            # Fallback: send without Markdown if parse fails
+            print(f"  ⚠️  Markdown failed ({e}), retrying as plain text...")
+            params = urllib.parse.urlencode({
+                "chat_id": chat_id,
+                "text": chunk.replace("*", "").replace("_", ""),
+            }).encode()
+            urllib.request.urlopen(
+                urllib.request.Request(f"{base}/sendMessage", data=params)
+            )
     print(f"  ✅ Message sent to Telegram chat {chat_id}")
 
 # ── 7. MAIN ──────────────────────────────────────────────────────────────────
